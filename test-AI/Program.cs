@@ -1,0 +1,487 @@
+using System.Diagnostics;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+
+static string MustEnv(string name)
+{
+    var v = Environment.GetEnvironmentVariable(name);
+    if (string.IsNullOrWhiteSpace(v))
+        throw new Exception($"Missing env var: {name}");
+    return v!;
+}
+
+static async Task<JsonElement> ReadJson(HttpResponseMessage res)
+{
+    var text = await res.Content.ReadAsStringAsync();
+    if (!res.IsSuccessStatusCode)
+        throw new Exception($"HTTP {(int)res.StatusCode}:\n{text}");
+    return JsonDocument.Parse(text).RootElement;
+}
+
+static async Task<string> CreateVectorStore(HttpClient http, string name)
+{
+    var body = JsonSerializer.Serialize(new { name });
+    var res = await http.PostAsync(
+        "https://api.openai.com/v1/vector_stores",
+        new StringContent(body, Encoding.UTF8, "application/json")
+    );
+    var json = await ReadJson(res);
+    return json.GetProperty("id").GetString()!;
+}
+
+static async Task<string> UploadFile(HttpClient http, string path)
+{
+    using var form = new MultipartFormDataContent();
+    form.Add(new StringContent("assistants"), "purpose");
+
+    await using var fs = File.OpenRead(path);
+    var fileContent = new StreamContent(fs);
+    fileContent.Headers.ContentType =
+        new MediaTypeHeaderValue("application/octet-stream");
+
+    form.Add(fileContent, "file", Path.GetFileName(path));
+
+    var res = await http.PostAsync("https://api.openai.com/v1/files", form);
+    var json = await ReadJson(res);
+    return json.GetProperty("id").GetString()!;
+}
+
+static async Task AttachFileToVectorStore(HttpClient http, string vectorStoreId, string fileId)
+{
+    var body = JsonSerializer.Serialize(new { file_id = fileId });
+    var res = await http.PostAsync(
+        $"https://api.openai.com/v1/vector_stores/{vectorStoreId}/files",
+        new StringContent(body, Encoding.UTF8, "application/json")
+    );
+    _ = await ReadJson(res);
+}
+
+static async Task<string> AskWithFileSearch(HttpClient http, string model, string vectorStoreId, string prompt)
+{
+    var payload = new
+    {
+        model,
+        input = prompt,
+        tools = new object[]
+        {
+            new {
+                type = "file_search",
+                vector_store_ids = new[] { vectorStoreId }
+            }
+        }
+    };
+
+    var body = JsonSerializer.Serialize(payload);
+    var res = await http.PostAsync(
+        "https://api.openai.com/v1/responses",
+        new StringContent(body, Encoding.UTF8, "application/json")
+    );
+
+    var json = await ReadJson(res);
+
+    if (json.TryGetProperty("output_text", out var ot) &&
+        ot.ValueKind == JsonValueKind.String)
+        return ot.GetString()!;
+
+    if (json.TryGetProperty("output", out var output) &&
+        output.ValueKind == JsonValueKind.Array)
+    {
+        foreach (var item in output.EnumerateArray())
+        {
+            if (item.TryGetProperty("type", out var t) &&
+                t.GetString() == "message" &&
+                item.TryGetProperty("content", out var content) &&
+                content.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var c in content.EnumerateArray())
+                {
+                    if (c.TryGetProperty("type", out var ct) &&
+                        ct.GetString() == "output_text" &&
+                        c.TryGetProperty("text", out var tx))
+                        return tx.GetString()!;
+                }
+            }
+        }
+    }
+
+    return json.ToString();
+}
+
+static void PrintUsage()
+{
+    Console.WriteLine(@"
+Usage:
+
+  dotnet run -- index --chunks ""<chunks_folder>"" [--name <vector_store_name>]
+
+  dotnet run -- ask ""<question>"" [--vs <vector_store_id>] [--model <model>]
+
+  dotnet run -- generate overview   [--out <folder>] [--vs <vector_store_id>] [--model <model>]
+  dotnet run -- generate workflows  [--out <folder>] [--vs <vector_store_id>] [--model <model>]
+  dotnet run -- generate faq        [--out <folder>] [--vs <vector_store_id>] [--model <model>]
+  dotnet run -- generate diagrams   [--out <folder>] [--vs <vector_store_id>] [--model <model>]
+  dotnet run -- generate environment-variables   [--out <folder>] [--vs <vector_store_id>] [--model <model>]
+
+  dotnet run -- export word [--out <folder>]
+  dotnet run -- export pdf  [--out <folder>]
+
+  dotnet run -- demo [--out <folder>]
+
+Notes:
+- index = one-time cost (uploads + embeddings)
+- ask / generate = cheap (reuse vector store)
+- export requires pandoc installed (brew install pandoc)
+");
+}
+
+static int RunProcess(string fileName, string arguments, string workingDir)
+{
+    var p = new Process();
+    p.StartInfo.FileName = fileName;
+    p.StartInfo.Arguments = arguments;
+    p.StartInfo.WorkingDirectory = workingDir;
+    p.StartInfo.RedirectStandardOutput = true;
+    p.StartInfo.RedirectStandardError = true;
+    p.StartInfo.UseShellExecute = false;
+
+    p.Start();
+    var stdout = p.StandardOutput.ReadToEnd();
+    var stderr = p.StandardError.ReadToEnd();
+    p.WaitForExit();
+
+    if (!string.IsNullOrWhiteSpace(stdout)) Console.WriteLine(stdout.Trim());
+    if (p.ExitCode != 0)
+        throw new Exception($"Command failed: {fileName} {arguments}\n{stderr}");
+
+    return p.ExitCode;
+}
+
+// ---------------- MAIN ----------------
+
+try
+{
+    var apiKey = MustEnv("OPENAI_API_KEY");
+
+    string defaultVs = "vs_6976904735208191b309858e3f2e0f74";
+    string vsId = defaultVs;
+
+    // Cheap model by default; override with --model if needed
+    string model = "gpt-5-mini";
+
+    string outDir = Path.Combine(Directory.GetCurrentDirectory(), "rag_outputs");
+
+    using var http = new HttpClient();
+    http.DefaultRequestHeaders.Authorization =
+        new AuthenticationHeaderValue("Bearer", apiKey);
+
+    if (args.Length == 0)
+    {
+        PrintUsage();
+        return;
+    }
+
+    string? GetFlag(string name)
+    {
+        for (int i = 0; i < args.Length; i++)
+            if (args[i] == name && i + 1 < args.Length)
+                return args[i + 1];
+        return null;
+    }
+
+    var vsFlag = GetFlag("--vs");
+    if (!string.IsNullOrWhiteSpace(vsFlag)) vsId = vsFlag!;
+    var modelFlag = GetFlag("--model");
+    if (!string.IsNullOrWhiteSpace(modelFlag)) model = modelFlag!;
+    var outFlag = GetFlag("--out");
+    if (!string.IsNullOrWhiteSpace(outFlag)) outDir = outFlag!;
+
+    Directory.CreateDirectory(outDir);
+
+    var cmd = args[0].ToLowerInvariant();
+
+    // -------- index --------
+    if (cmd == "index")
+    {
+        var chunks = GetFlag("--chunks");
+        var name = GetFlag("--name") ?? "replybrary_chunks";
+
+        if (string.IsNullOrWhiteSpace(chunks) || !Directory.Exists(chunks))
+            throw new Exception("index requires: --chunks \"<path>\"");
+
+        Console.WriteLine("Creating vector store...");
+        var newVs = await CreateVectorStore(http, name);
+        Console.WriteLine($"Vector store: {newVs}");
+
+        var files = Directory.GetFiles(chunks!, "*.json", SearchOption.AllDirectories);
+        Console.WriteLine($"Found {files.Length} json files.");
+
+        foreach (var f in files)
+        {
+            Console.WriteLine($"Uploading: {Path.GetFileName(f)}");
+            var fileId = await UploadFile(http, f);
+            await AttachFileToVectorStore(http, newVs, fileId);
+            Console.WriteLine($"  attached file_id={fileId}");
+        }
+
+        Console.WriteLine("Done. Save this vector store id and reuse it:");
+        Console.WriteLine(newVs);
+        return;
+    }
+
+    // -------- ask --------
+    if (cmd == "ask")
+    {
+        if (args.Length < 2)
+            throw new Exception("ask requires a question: dotnet run -- ask \"...\"");
+
+        var question = string.Join(" ", args.Skip(1));
+        var prompt =
+$@"Answer using ONLY the uploaded solution chunks.
+If the information is not present, say 'Not found in uploaded files.'
+
+Question:
+{question}";
+
+        var answer = await AskWithFileSearch(http, model, vsId, prompt);
+        Console.WriteLine(answer);
+        return;
+    }
+
+    // -------- generate --------
+    if (cmd == "generate")
+    {
+        if (args.Length < 2)
+            throw new Exception("generate requires a type: overview | workflows | faq | diagrams");
+
+        var kind = args[1].ToLowerInvariant();
+
+        if (kind == "overview")
+        {
+            var prompt =
+@"Generate a clean Markdown solution overview based ONLY on the uploaded chunks.
+Include:
+- Key counts (workflows, env vars, canvas app groups)
+- List workflows
+- List environment variables (names)
+- Keep it concise, headings + bullet points.";
+
+            var md = await AskWithFileSearch(http, model, vsId, prompt);
+            var path = Path.Combine(outDir, "overview.md");
+            File.WriteAllText(path, md, Encoding.UTF8);
+            Console.WriteLine($"Wrote: {path}");
+            return;
+        }
+
+        if (kind == "workflows")
+        {
+            var prompt =
+@"Summarise each workflow in Markdown using ONLY the uploaded chunks.
+For each workflow include:
+- Workflow name
+- What it does (1–3 lines)
+- Any obvious trigger/purpose if available
+If missing details, say 'Not found in uploaded files.'";
+
+            var md = await AskWithFileSearch(http, model, vsId, prompt);
+            var path = Path.Combine(outDir, "workflows.md");
+            File.WriteAllText(path, md, Encoding.UTF8);
+            Console.WriteLine($"Wrote: {path}");
+            return;
+        }
+
+        if (kind == "faq")
+        {
+            var prompt =
+@"Create a Markdown FAQ for the solution using ONLY the uploaded chunks.
+Include ~10 Q&As (workflows, env vars, canvas apps, what the solution contains).
+If info is missing, say 'Not found in uploaded files.' Keep it concise.";
+
+            var md = await AskWithFileSearch(http, model, vsId, prompt);
+            var path = Path.Combine(outDir, "faq.md");
+            File.WriteAllText(path, md, Encoding.UTF8);
+            Console.WriteLine($"Wrote: {path}");
+            return;
+        }
+
+
+        if (kind == "diagrams")
+        {
+            var prompt =
+@"Output ONLY ONE Mermaid diagram (no explanation), using flowchart LR.
+
+It MUST include all three groups as explicit nodes:
+1) Canvas Apps (both apps as nodes)
+2) Workflows (each workflow as its own node — do NOT use a single 'Workflows' hub node)
+3) Environment Variables (each env var as its own node)
+
+Connections rules:
+- Connect each Canvas App node to each Workflow node (high-level relationship).
+- Connect each Workflow node to a hub node named: Environment Variables (shared)
+- Connect that hub node to EVERY environment variable node.
+- Do NOT invent per-workflow env var mappings unless explicitly stated in uploaded chunks.
+
+Formatting rules:
+- Use subgraphs named exactly: CanvasApps, Workflows, EnvironmentVariables
+- Use safe IDs:
+  - CA1, CA2 for canvas apps
+  - W1..W10 for workflows
+  - EVH for env var hub
+  - E1..E16 for env vars
+- Labels must use the real names from the uploaded chunks.
+- Output ONLY valid Mermaid code. No second diagram. No markdown fences.";
+
+            var mermaid = await AskWithFileSearch(http, model, vsId, prompt);
+
+            mermaid = mermaid.Replace("```mermaid", "").Replace("```", "").Trim();
+
+            var path = Path.Combine(outDir, "architecture.mmd");
+            File.WriteAllText(path, mermaid, Encoding.UTF8);
+            Console.WriteLine($"Wrote: {path}");
+            return;
+        }
+
+        if (kind == "environment-variables")
+        {
+            var prompt =
+                @"Create a json response for the solution using ONLY the specified structure to 
+                capture environment variables and details such as type, description, name of the variable in Dev Environment, name of the variable in UAT Environment, name of the variable in Production Environment.
+                For description fields, use brief text (1-2 sentences) taken from the uploaded chunks.
+                If any information is missing like name, type, dev_value, test_value, or production_value, don't assume, use null for that field.
+                Structure:
+                [
+                {
+                    ""Name"": ""<Environment Variable Name>"",
+                    ""Type"": ""<Type>"",
+                    ""Description"": ""<Description>"",
+                    ""DevValue"": ""<Dev Value - Name of Dev Environment - DEV>"",
+                    ""TestValue"": ""<Test Value - Name of UAT Environment - UAT>"",
+                    ""ProductionValue"": ""<Production Value - Name of Production Environment>""
+                },
+                ...
+                ]
+                ";
+            var json_res = await AskWithFileSearch(http, model, vsId, prompt);
+            // var json_res = "[\n  {\n    \"Name\": \"Replybrary_App_Link (wmreply_Replybrary_App_Link)\",\n    \"Type\": \"String\",\n    \"Description\": \"Open Reply-brary App link used to open the Reply-brary PowerApp. \",\n    \"DevValue\": \"wmreply_Replybrary_App_Link\",\n    \"TestValue\": null,\n    \"ProductionValue\": null\n  },\n  {\n    \"Name\": \"Replybrary_SP_Site (wmreply_Replybrary_SP_Site)\",\n    \"Type\": \"String\",\n    \"Description\": \"SharePoint site URL used as the dataset parameter in SharePoint actions. \",\n    \"DevValue\": \"wmreply_Replybrary_SP_Site\",\n    \"TestValue\": null,\n    \"ProductionValue\": null\n  },\n  {\n    \"Name\": \"Replybrary_Project_List (wmreply_Replybrary_Project_List)\",\n    \"Type\": \"String\",\n    \"Description\": \"Identifier (list GUID) for the Replybrary Project List used as the SharePoint table parameter. \",\n    \"DevValue\": \"wmreply_Replybrary_Project_List\",\n    \"TestValue\": null,\n    \"ProductionValue\": null\n  }\n]";
+            //construct table 
+
+            var parsedJsonRes = JsonSerializer.Deserialize<HashSet<EnvironmentVariableValue>>(json_res);
+            Console.WriteLine(parsedJsonRes.GetType());
+
+            foreach (var item in parsedJsonRes)
+            {
+                try
+                {
+                    var envVar = JsonSerializer.Deserialize<EnvironmentVariableValue>(item.ToString());
+                    if (envVar != null)
+                    {
+                        if (envVar.DevValue == null)
+                        {
+                            envVar.DevValue = "<not specified>";
+                        }
+
+                        if (envVar.TestValue == null)
+                        {
+                            envVar.TestValue = "<not specified>";
+                        }
+
+                        if (envVar.ProductionValue == null)
+                        {
+                            envVar.ProductionValue = "<not specified>";
+                        }
+
+                        parsedJsonRes.Add(envVar);
+                    }
+                }
+                catch (JsonException)
+                {
+                    Console.WriteLine($"Failed to parse item: {item}");
+                }
+            }
+
+            //loop through parsedJsonRes for me
+            foreach (var envVar in parsedJsonRes)
+            {
+                Console.WriteLine($"Name: {envVar.Name}");
+                Console.WriteLine($"Type: {envVar.Type}");
+                Console.WriteLine($"Description: {envVar.Description}");
+                Console.WriteLine($"Dev Value: {envVar.DevValue}");
+                Console.WriteLine($"Test Value: {envVar.TestValue}");
+                Console.WriteLine($"Production Value: {envVar.ProductionValue}");
+                Console.WriteLine();
+            }
+
+            var path = Path.Combine(outDir, "environment-variables.xlsx");
+            Diagram.construct_table(parsedJsonRes, path); 
+
+            // // File.WriteAllText(path, md, Encoding.UTF8);
+            // Console.WriteLine($"Response: {json_res}");
+            return;
+        }
+
+        throw new Exception("Unknown generate type. Use: overview | workflows | faq | diagrams");
+    }
+
+    // -------- export --------
+    if (cmd == "export")
+    {
+        if (args.Length < 2)
+            throw new Exception("export requires: word | pdf");
+
+        var kind = args[1].ToLowerInvariant();
+
+        var overview = Path.Combine(outDir, "overview.md");
+        var workflows = Path.Combine(outDir, "workflows.md");
+        var faq = Path.Combine(outDir, "faq.md");
+
+        if (!File.Exists(overview) || !File.Exists(workflows) || !File.Exists(faq))
+            throw new Exception($"Missing markdown files in {outDir}. Run generate first.");
+
+        if (kind == "word")
+        {
+            RunProcess("pandoc", $"\"{overview}\" -o \"Replybrary_Overview.docx\" --toc", outDir);
+            RunProcess("pandoc", $"\"{workflows}\" -o \"Replybrary_Workflows.docx\" --toc", outDir);
+            RunProcess("pandoc", $"\"{faq}\" -o \"Replybrary_FAQ.docx\" --toc", outDir);
+            Console.WriteLine("Wrote Word docs into: " + outDir);
+            return;
+        }
+
+        if (kind == "pdf")
+        {
+            RunProcess("pandoc", $"\"{overview}\" -o \"Replybrary_Overview.pdf\" --toc", outDir);
+            RunProcess("pandoc", $"\"{workflows}\" -o \"Replybrary_Workflows.pdf\" --toc", outDir);
+            RunProcess("pandoc", $"\"{faq}\" -o \"Replybrary_FAQ.pdf\" --toc", outDir);
+            Console.WriteLine("Wrote PDFs into: " + outDir);
+            return;
+        }
+
+        throw new Exception("export requires: word | pdf");
+    }
+
+    // -------- demo --------
+    if (cmd == "demo")
+    {
+        Console.WriteLine("Demo outputs folder:");
+        Console.WriteLine(outDir);
+        Console.WriteLine();
+        Console.WriteLine("Recommended demo run:");
+        Console.WriteLine("  dotnet run -- generate overview");
+        Console.WriteLine("  dotnet run -- generate workflows");
+        Console.WriteLine("  dotnet run -- generate faq");
+        Console.WriteLine("  dotnet run -- generate diagrams");
+        Console.WriteLine("  dotnet run -- export word   (requires pandoc)");
+        Console.WriteLine("  dotnet run -- export pdf    (requires pandoc)");
+        Console.WriteLine();
+        Console.WriteLine("Open outputs in Finder:");
+        Console.WriteLine($"  open \"{outDir}\"");
+        return;
+    }
+
+    PrintUsage();
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine(ex.Message);
+    throw; 
+    // Environment.Exit(1);
+}
