@@ -1,0 +1,7 @@
+**/bin
+**/obj
+**/.git
+**/*.user
+**/TestFiles
+**/parsed_output
+**/rag_outputs

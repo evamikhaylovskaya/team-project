@@ -1,0 +1,21 @@
+# Full stack: frontend (nginx) + backend API
+# Run from repo root: docker compose up --build
+# Frontend: http://localhost
+# Backend API: http://localhost:5280
+
+services:
+  frontend:
+    build:
+      context: frontend/doctor-power
+      dockerfile: Dockerfile.prod
+    ports:
+      - "80:80"
+
+  backend:
+    build:
+      context: backend
+      dockerfile: Dockerfile
+    ports:
+      - "5280:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development

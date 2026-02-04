@@ -24,7 +24,8 @@ public class Program
                             policy  =>
                             {
                                 policy.WithOrigins(
-                                    "http://localhost:5173", 
+                                    "http://localhost:5173",
+                                    "http://localhost",
                                     "https://client.scalar.com"
                                 ).AllowAnyHeader()
                                 .AllowAnyMethod();
