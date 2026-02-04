@@ -3,9 +3,6 @@ import { FileCheck,Trash2 } from 'lucide-react';
 import axiosPublic from "../api/axios";
 import uploadFile from "../api/file";
 
-//temp
-import axios from 'axios';
-
 
 const Dashboard = () => {
 
@@ -25,8 +22,8 @@ const Dashboard = () => {
 
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedModes, setSelectedModes] = useState([]);
-  const [progress, setProgress] = useState(0);
-  const [isUploading, setIsUploading] = useState(false);
+  const [_progress, setProgress] = useState(0);
+  const [_isUploading, setIsUploading] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
 
   const abortRef = useRef(null);//like useState but not rerender 
@@ -82,8 +79,8 @@ const Dashboard = () => {
             setProgress(0);
             try {
                 if (fileInputRef.current) fileInputRef.current.value = "";
-            } catch (e) {
-                
+            } catch {
+              // ignore clear errors
             }
           } else {
             alert('Please select a .zip file only.');
@@ -98,12 +95,12 @@ const Dashboard = () => {
       // clear the native input so selecting the same file again will fire change
       try {
         if (fileInputRef.current) fileInputRef.current.value = "";
-      } catch (e) {
+      } catch {
         // ignore
       }
   };
 
-  const onGenerateOutputFile = () => {
+  const _onGenerateOutputFile = () => {
       if(!selectedFile) return;
 
       const fd = new FormData(); 
@@ -117,7 +114,7 @@ const Dashboard = () => {
           setIsUploading(true);
 
           //FIXME: use axiosPrivate and complete uploadFile function
-          const res = uploadFile()
+          void uploadFile();
       } catch (error) {
           if (error.name == "CanceledError"){
               console.log("Upload canceled");
@@ -143,7 +140,7 @@ const Dashboard = () => {
       console.log(response.data);
   }
 
-  const onCancelUpload = () => {
+  const _onCancelUpload = () => {
       abortRef.current?.abort(); 
   }
 
